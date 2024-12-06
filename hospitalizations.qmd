@@ -23,7 +23,7 @@ packages <- function(x){
     }
   }
 }
-packages(c("haven", "readxl", "tidyverse" , "data.table" , "naniar", "rockchalk", "lubridate", "kableExtra", "DT", "formatR", "zoo", "binom", "plotly", "janitor", "sjlabelled", "Hmisc", "rms", "aod", "sandwich", "lmtest", "tableone", "broom", "investr", "survminer", "survival", "cmprsk", "condSURV", "tidycmprsk", "gtsummary", "ggsurvfit"))
+packages(c("haven", "readxl", "tidyverse" , "data.table" , "naniar", "rockchalk", "lubridate", "kableExtra", "DT", "formatR", "zoo", "binom", "plotly", "janitor", "sjlabelled", "Hmisc", "rms", "aod", "sandwich", "lmtest", "tableone", "broom", "investr", "splines", "mice", "glmnet"))
 
 ```
 
@@ -44,6 +44,8 @@ procedure <- read_sas("J:/ID/CFAR/ID Clinic Database/Clinical Core/Admin II/Proj
 riskfactor <- read_sas("J:/ID/CFAR/ID Clinic Database/Clinical Core/Admin II/Projects/CNICS/CNICS_Submissions/2024_07/FINAL/riskfactor.sas7bdat")
 visitappointment <- read_sas("J:/ID/CFAR/ID Clinic Database/Clinical Core/Admin II/Projects/CNICS/CNICS_Submissions/2024_07/FINAL/visitappointment.sas7bdat")
 ccs_icd10 <- read_excel("J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Hospitalizations/DXCCSR_v2025-1.xlsx")
+ccs_icd9 <- read_excel("J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Hospitalizations/ccs_icd9.xlsx")
+icd9_10_map <- read_excel("J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Hospitalizations/icd9toicd10cmgem.xlsx")
 zip_ses <- read_excel("J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Hospitalizations/zip_ses.xlsx")
 ```
 
@@ -51,7 +53,7 @@ zip_ses <- read_excel("J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Hosp
 ## Demographics
 
 ```{r}
-demographic <- demographic |>
+demographic1 <- demographic |>
   clean_names() |>
   mutate_if(is.character, tolower) |>
   mutate(race_eth = case_when(race %in% c("american indian", "asian", "") ~ "other",
@@ -59,8 +61,8 @@ demographic <- demographic |>
                               TRUE ~ race),
          gender = ifelse(present_sex == "intersexed", "other", present_sex)) |>
   select(patient_key, birth_year, gender, race_eth, death_date) |>
-  filter(is.na(death_date) | death_date > as.Date("2015-01-01"))
-# N = 3615
+  filter(is.na(death_date) | death_date > as.Date("2014-04-01"))
+# N = 3661
 ```
 
 ### Insurance
@@ -117,13 +119,13 @@ risk_factor_wide <- riskfactor1 |>
 #### Merge demographic variables
 
 ```{r}
-demographic1 <- demographic |>
+demographic2 <- demographic1 |>
   left_join(insurance1 |> select(patient_key, insurance_type, insurance_start_date)) |>
   left_join(geographic1 |> select(patient_key, zip_code, census_tract, pctile), relationship = "many-to-many") |>
   left_join(risk_factor_wide |> select(-other_risk)) |>
   # Replace missing values with median
   mutate(pctile = ifelse(is.na(pctile), median(pctile, na.rm = TRUE), pctile),
-         ses_quartile = ntile(pctile, 4), na.rm = TRUE)
+         ses_lt_median = ifelse(pctile < median(pctile), TRUE, FALSE))
 ```
 
 ## Clinical variables
@@ -161,17 +163,45 @@ adi <- diagnosis1 |>
 discharged1 <- discharged |>
   clean_names() |>
   mutate_if(is.character, str_to_lower) |>
-  filter(admit_date > as.Date("2016-01-01")) |>
+  filter(admit_date > as.Date("2014-04-01"),
+         patient_key %in% demographic$patient_key) |>
   mutate(discharge_dx = str_remove(discharge_dx, "\\.")) |>
-  select(patient_key, discharge_dx, dx_code_name, discharge_dx_date, ranking, encounter_id, admit_date, discharge_date) |>
-  filter(patient_key %in% demographic$patient_key)
+  select(patient_key, discharge_dx, dx_code_name, dx_code_set_name, discharge_dx_date, ranking, encounter_id, admit_date, discharge_date) |>
+  distinct() |>
+  group_by(patient_key, admit_date) |>
+  mutate(num_discharge_dx = max(ranking)) |>
+  ungroup()
+n_distinct(discharged1$patient_key)
+```
+
+### ICD-9 CCS categories
+
+```{r}
+# General equivalence mapping
+gem <- icd9_10_map |>
+  clean_names() |>
+  select(icd9cm, icd10cm) |>
+  mutate_all(tolower) |>
+  mutate(across(everything(), ~ str_trim(.)))
+
+# ICD-9 CM Clinical Classification Software
+ccs9 <- ccs_icd9 |>
+  clean_names() |>
+  mutate_if(is.character, str_to_lower) |>
+  mutate(across(everything(), ~ str_replace_all(., "'", ""))) |>
+  mutate(across(everything(), ~ str_trim(.))) |>
+  select(icd_9_cm_code, icd_9_cm_code_description, ccs_category_description) |>
+  rename(icd9cm = icd_9_cm_code,
+         code_description = icd_9_cm_code_description,
+         category_description = ccs_category_description) |>
+  left_join(gem, relationship = "many-to-many")
 ```
 
 ### ICD-10 CCS categories
 
 ```{r}
 # ICD-10 CM Clinical Classification Software
-ccs <- ccs_icd10 |>
+ccs10 <- ccs_icd10 |>
   clean_names() |>
   mutate_if(is.character, tolower) |>
   select(icd_10_cm_code, icd_10_cm_code_description, ccsr_category_1_description) |>
@@ -180,10 +210,16 @@ ccs <- ccs_icd10 |>
          cat_descr = ccsr_category_1_description)
 ```
 
-
 ```{r}
-discharge_primarydx_index <- discharged1 |>
-  left_join(ccs, by = c("discharge_dx" = "dx_code"), relationship = "many-to-many") |>
+discharged2 <- discharged1 |>
+  left_join(ccs9, by = c("discharge_dx" = "icd9cm"), relationship = "many-to-many") |>
+  mutate(dx_old = discharge_dx,
+         discharge_dx = ifelse(dx_code_set_name == "icd-9-cm", icd10cm, discharge_dx)) |> # Replace ICD-9 codes with equivalent ICD-10 codes
+  select(-c(code_description, category_description, icd10cm)) |>
+  distinct()
+
+discharge_primarydx_index <- discharged2 |>
+  left_join(ccs10, by = c("discharge_dx" = "dx_code"), relationship = "many-to-many") |>
   group_by(patient_key) |>
   slice_min(discharge_date) |>
   ungroup() |>
@@ -192,13 +228,13 @@ discharge_primarydx_index <- discharged1 |>
   ungroup()
 
 n_distinct(discharge_primarydx_index$patient_key)
-# N = 771
+# N = 907
 ```
 
-### Medications
+### ARVs
 
 ```{r}
-medication <- medication |>
+arv <- medication |>
   clean_names() |>
   mutate_if(is.character, tolower) |>
   filter(type == "arv") |>
@@ -226,10 +262,10 @@ initial_visits <- visitappointment |>
 ## All admissions
 
 ```{r}
-admissions_all <- discharged1 |>
-  select(patient_key, admit_date, discharge_date) |>
+admissions_all <- discharged2 |>
+  select(patient_key, admit_date, discharge_date, num_discharge_dx) |>
   distinct() |>
-  left_join(demographic1, relationship = "many-to-many") |>
+  left_join(demographic2, relationship = "many-to-many") |>
   filter(admit_date > insurance_start_date) |>
   # Select observation with most proximal insurance start date
   group_by(patient_key, admit_date) |>
@@ -248,14 +284,14 @@ admissions_all1 <- admissions_all |>
          # Remove those discharged same day as admission
          los > 0) |>
   add_count(patient_key, name = "num_admits") |>
-  # Remove those who died during first hospital admission or died within 180 days of discharge without readmission
-  filter(!(num_admits == 1 & death_date - discharge_date <= 180) | is.na(death_date)) |>
+  # Remove those who died during first hospital admission or died within 30 days of discharge without readmission
+  filter(!(num_admits == 1 & death_date - discharge_date <= 30) | is.na(death_date)) |>
   group_by(patient_key) |>
   arrange(admit_date, discharge_date) |>
   # Some readmitted on same day as discharge - transfers
   mutate(days_to_readmit = as.numeric(admit_date - dplyr::lag(discharge_date))) |> 
   ungroup() |>
-  select(-c(num_admits, encounter_date))
+  select(-c(num_admits, encounter_date, year_admit, birth_year))
 ```
 
 ```{r}
@@ -281,14 +317,13 @@ admissions_all2 <- admissions_all1 |>
   ungroup()
 
 n_distinct(admissions_all2$patient_key)
-# 716
+# N = 839
 ```
 
 ## Index and readmissions
 
 ```{r}
 # Index admissions
-# N = 716
 admissions_index <- admissions_all2 |>
   group_by(patient_key) |>
   # Select index admission
@@ -296,17 +331,17 @@ admissions_index <- admissions_all2 |>
   ungroup() |> 
   select(-c(n, days_to_readmit))
 
-# Readmissions within 180 days of index
-# N = 184
-admissions_180d <- admissions_all2 |>
-  filter(n == 2 & days_to_readmit %in% 1:180) |>
+# Readmissions within 30 days of index
+admissions_30d <- admissions_all2 |>
+  filter(n == 2 & days_to_readmit %in% 1:30) |>
   select(-n)
 
 n_distinct(admissions_index$patient_key)
-n_distinct(admissions_180d$patient_key)
+n_distinct(admissions_30d$patient_key)
+# N = 106 readmissions
 ```
 
-## Prior hospitalizations
+## Add prior hospitalizations
 
 ```{r}
 prior_hosp <- hospitalization |>
@@ -327,16 +362,18 @@ prior_hosp <- hospitalization |>
   distinct()
 ```
 
-Remove patients with admissions within 180 days prior to index, add variable for readmission within 180 days
+Remove patients with admissions within 30 days prior to index, add variable for readmission within 30 days
 
 ```{r}
 df1 <- admissions_index |>
   left_join(prior_hosp |> select(patient_key, prior_admit_date, num_prior_admissions) |> distinct()) |>
-  left_join(admissions_180d |> select(patient_key, days_to_readmit)) |>
-  mutate(num_prior_admissions = ifelse(is.na(num_prior_admissions), 0, num_prior_admissions),
-         readmit_180 = ifelse(!is.na(days_to_readmit), TRUE, FALSE)) |>
-  filter(admit_date - prior_admit_date > 180 | is.na(prior_admit_date)) |> 
-  select(-c(prior_admit_date, days_to_readmit))
+  left_join(admissions_30d |> select(patient_key, days_to_readmit)) |>
+  mutate(#num_prior_admissions = ifelse(is.na(num_prior_admissions), 0, num_prior_admissions),
+         readmit_30 = ifelse(!is.na(days_to_readmit), TRUE, FALSE)) |>
+  filter(admit_date - prior_admit_date > 30 | is.na(prior_admit_date)) |> 
+  select(-c(prior_admit_date, days_to_readmit, num_prior_admissions, zip_code, census_tract, pctile))
+df1 |> tabyl(readmit_30)
+names(df1)
 ```
 
 Prior ADIs and primary discharge diagnoses
@@ -347,10 +384,9 @@ df2 <- df1 |>
   mutate(adi = ifelse(admit_date < diagnosis_date | is.na(diagnosis_date), FALSE, TRUE)) |>
   select(-diagnosis_date) |>
   left_join(discharge_primarydx_index |> select(patient_key, discharge_dx, cat_descr))
-df2 |> tabyl(readmit_180)
 ```
 
-## Labs
+## Add lab results
 
 ```{r}
 labs1 <- labs |>
@@ -375,6 +411,7 @@ lab_cd4_current <- labs1 |>
   group_by(patient_key) |>
   slice(which.min(admit_date - result_date)) |>
   ungroup() |>
+  # Set to NA if no result in 2 years prior to admission
   mutate(result = ifelse(admit_date - result_date > 730, NA, result)) |>
   filter(!is.na(result)) |>
   rename(cd4_recent = result,
@@ -385,6 +422,7 @@ lab_rna_current <- labs1 |>
   group_by(patient_key) |>
   slice(which.min(admit_date - result_date)) |>
   ungroup() |>
+  # Set to NA if no result in 2 years prior to admission
   mutate(result = ifelse(admit_date - result_date > 730, NA, result),
          suppressed_vl = ifelse(result <= 50, TRUE, FALSE)) |>
   filter(!is.na(result)) |>
@@ -399,35 +437,28 @@ df3 <- df2 |>
   left_join(lab_rna_current |> select(patient_key, rna_recent, rna_recent_date, suppressed_vl))
 ```
 
-## ARVs
+## Add ART
 
 ```{r}
-art_start <- medication |>
+art_at_admission <- arv |>
   inner_join(df1 |> select(patient_key, admit_date)) |>
   mutate(days_since_art_start = as.numeric(admit_date - start_date),
          days_since_art_end = as.numeric(admit_date - end_date)) |>
-  filter(days_since_art_start > 0)
-
-art_start1 <- art_start |>
-  group_by(patient_key) |>
-  slice(which.max(days_since_art_start)) |>
-  ungroup()
-
-art_at_admission <- art_start |>
+  filter(days_since_art_start > 0,
+         days_since_art_end < 0) |>
+  select(patient_key, days_since_art_start, days_since_art_end) |>
+  distinct() |>
   group_by(patient_key) |>
   slice(which.min(days_since_art_start)) |>
   ungroup() |>
-  filter(days_since_art_end > 1)
-```
+  mutate(no_art_at_admission = FALSE)
 
-```{r}
 df4 <- df3 |>
-  left_join(art_at_admission |> select(patient_key) |> mutate(art_at_admission = FALSE)) |>
-  left_join(art_start1 |> select(patient_key, days_since_art_start)) |>
-  mutate(art_at_admission = ifelse(is.na(art_at_admission), TRUE, art_at_admission))
+  left_join(art_at_admission |> select(patient_key, no_art_at_admission)) |>
+  mutate(no_art_at_admission = ifelse(is.na(no_art_at_admission), TRUE, no_art_at_admission))
 ```
 
-## Clinic visits
+## Add clinic visits
 
 ```{r}
 clinic_visits <- visitappointment |>
@@ -443,13 +474,54 @@ clinic_visits <- visitappointment |>
 
 ```{r}
 df5 <- df4 |>
-  select(patient_key, gender, race_eth, zip_code, census_tract, ses_quartile, year_admit, age_at_index, insurance_type, msm, idu, adi, discharge_dx, cat_descr, cd4_nadir, cd4_recent, suppressed_vl, num_prior_admissions, art_at_admission, days_since_art_start, los, readmit_180) |>
+  select(patient_key, gender, race_eth, ses_lt_median, age_at_index, insurance_type, msm, idu, adi, discharge_dx, num_discharge_dx, cat_descr, cd4_nadir, cd4_recent, suppressed_vl, no_art_at_admission, los, readmit_30) |>
   left_join(clinic_visits |> select(patient_key, days_since_clinic_visit)) |>
   mutate(cd4_nadir = ifelse(is.na(cd4_nadir), median(cd4_nadir, na.rm = TRUE), cd4_nadir))
-
-names(df5)
-# fwrite(df5, "J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Hospitalizations/CNICS_hosp_readmission.csv")
 ```
+
+```{r}
+df6 <- df5 |>
+  mutate(age_grp = case_when(age_at_index < 45 ~ "18-44",
+                             age_at_index %in% 45:64 ~ "45-64",
+                             TRUE ~ "65plus"),
+         cd4_nadir_lt200 = ifelse(cd4_nadir < 200, TRUE, FALSE),
+         #cd4_recent_lt500 = ifelse(cd4_recent < 500, TRUE, FALSE),
+         cd4_recent = case_when(cd4_recent < 500 ~ "cd4_recent_lt500",
+                                cd4_recent >= 500 ~ "cd4_recent_500plus",
+                                TRUE ~ "cd4_recent_missing"),
+         los_4plus = ifelse(los > 3, TRUE, FALSE),
+         primary_dx_hiv = ifelse(cat_descr == "hiv infection", TRUE, FALSE),
+         no_clinic_visit_1yr = ifelse(days_since_clinic_visit > 365, TRUE, FALSE),
+         discharge_dx_20plus = ifelse(num_discharge_dx >= 20, TRUE, FALSE),
+         a = TRUE,
+         a1 = TRUE,
+         a2 = TRUE,
+         a3 = TRUE,
+         a4 = TRUE) |>
+  pivot_wider(names_from = gender, values_from = a, values_fill = FALSE, names_prefix = "gender_") |>
+  pivot_wider(names_from = age_grp, values_from = a1, values_fill = FALSE, names_prefix = "age_") |>
+  pivot_wider(names_from = race_eth, values_from = a2, values_fill = FALSE, names_prefix = "race_eth_") |>
+  pivot_wider(names_from = insurance_type, values_from = a3, values_fill = FALSE, names_prefix = "insurance_") |>
+  pivot_wider(names_from = cd4_recent, values_from = a4, values_fill = FALSE, names_prefix = "") |>
+  clean_names() |>
+  select(patient_key, age_18_44, age_45_64, age_65plus, gender_male, race_eth_black, race_eth_hispanic, race_eth_other, insurance_medicaid, insurance_medicare, insurance_other, ses_lt_median, msm, idu, no_clinic_visit_1yr, adi, cd4_recent_lt500, cd4_recent_missing, cd4_nadir_lt200, no_art_at_admission, los_4plus, primary_dx_hiv, discharge_dx_20plus, readmit_30) |>
+  mutate_if(is.logical, as.numeric)
+
+glimpse(df6)
+# fwrite(df6, "J:/ID/CFAR/ID Clinic Database/Projects/Heather/UCHCC/Hospitalizations/CNICS_hosp_readmission.csv")
+```
+
+```{r}
+df6 |>
+  tabyl(no_art_at_admission, readmit_30) |>
+  adorn_totals(c("row", "col")) |>
+  adorn_percentages() |>
+  adorn_pct_formatting() |>
+  adorn_ns() |>
+  adorn_title()
+```
+
+# Missing data
 
 ```{r}
 describe_missingness <- function(data) {
@@ -464,12 +536,79 @@ describe_missingness <- function(data) {
   
   return(missing_summary)
 }
-describe_missingness(df5) |> filter(missing_count > 0)
+describe_missingness(df6) |> filter(missing_count > 0)
 ```
 
+```{r}
+# CNICS_hosp_readmission <- read_csv("CNICS_hosp_readmission.csv")
+model <- glm(readmit_30 ~ rcs(age_at_index, 5), data = df5, family = binomial)
+# Create a sequence of values to predict probabilities
+df5$prob <- predict(model, newdata = df5, type = "response")
+# Plot the association between cd4_recent and predicted probability of readmit_30
+ggplot(df5, aes(x = age_at_index, y = prob)) +
+  geom_smooth() +
+  theme_minimal()
 
+quantile(df5$age_at_index, na.rm = TRUE)
+```
 
+MICE with pooled logistic model
 
+```{r}
+imputed_data <- mice(df5 |> select(-patient_key), method = 'pmm', m = 5, seed = 123)  # Using predictive mean matching
+
+models <- list()  # To store models
+for (i in 1:5) {
+  # Get i-th completed dataset
+  completed_data <- complete(imputed_data, action = i)
+  
+  models[[i]] <- glm(readmit_30 ~ adi + msm  + idu + rcs(days_since_clinic_visit,5) + gender + race_eth + insurance_type + ses_lt_median + rcs(cd4_nadir,5) + rcs(cd4_recent,5), data = completed_data, family = poisson(link = "log"))
+}
+# Pool results from multiple imputations
+pooled_results <- pool(models)
+summary(pooled_results)
+```
+
+Elastic Net model
+
+```{r}
+X <- as.matrix(df6[, setdiff(names(df6 |> select(-patient_key)), "readmit_30")])
+y <- as.matrix (df6["readmit_30"])
+
+model <- cv.glmnet(
+    X, y,
+    alpha = 0.5,
+    family = "binomial",
+    standardize = TRUE, 
+    nfolds = 5
+  )
+
+coef(model, s = "lambda.min")
+```
+
+Final data logistic model
+
+```{r}
+model <- glm(readmit_30 ~ ., data = df6 |> select(-patient_key), family = binomial(link = "logit"))
+summary(model)
+```
+
+Final data modified Poisson model
+
+```{r}
+a <- df5 |> mutate(los_4plus = ifelse(los > 3, TRUE, FALSE))
+
+glmmodel <- glm(readmit_30 ~ adi + gender + race_eth + insurance_type + rcs(cd4_nadir,5) + rcs(cd4_recent,5), data = a, family = poisson(link = "log"))
+summary(glmmodel)
+
+est <- coeftest(glmmodel, vcov = sandwich)
+estimate <- round(exp(est[2,1]),2)
+stderr <- est[2,2]
+lower <- round(exp(est[2,1] - 1.96 * stderr),2)
+upper <- round(exp(est[2,1] + 1.96 * stderr),2)
+
+names(a)
+```
 
 
 
